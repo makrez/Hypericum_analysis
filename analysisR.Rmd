@@ -1,0 +1,404 @@
+---
+title: "Hypericum analysis"
+author: "Marco Kreuzer"
+output: html_document
+---
+
+## Description
+
+This analysis is published in:
+Howard C, Hill E, Kreuzer M, Mali P, Masiero E, Slater A, Sgamma T (2019) DNA Authentication of St John’s Wort (Hypericum perforatum L.) Commercial Products Targeting the ITS Region; Genes 10(4), 286
+
+This file consists of the metabarcoding analysis after the querying the reads to
+the NCBI database. The blast output was parsed with MEGAN. The starting data is the file
+__specieslist.ncbi.txt__.
+
+```{r, message=FALSE}
+library(here)
+library(tidyverse)
+library(kableExtra)
+```
+
+## Analysis of NBCI BLAST output
+
+```{r}
+# Loading Data
+hypericum_raw2 <- read.csv("specieslist.ncbi.txt", header = F)
+names(hypericum_raw2) <- c("Sample", "Region","Read_name","Size","Taxon")
+
+```
+
+### Data Transformation
+
+```{r}
+# Select ITS1 and ITS2
+hypericum_raw <-  hypericum_raw2 %>% select(Sample, Region, Size, Taxon, Read_name ) %>% 
+  filter(Region == "ITS1" | Region == "ITS2") %>% ungroup()
+
+# Add unique identifier
+hypericum <- hypericum_raw %>% 
+  mutate(Sample_id = paste(Sample, Region, sep = "_")) %>% 
+  mutate(pkey = paste0(Sample_id,Taxon))
+
+# calculate number of reads per sample
+size_per_id <- hypericum %>% 
+  select(Sample_id,Size) %>% 
+  group_by(Sample_id) %>% 
+  summarize(Total_size = sum(Size))
+
+# add number of reads to each read and calculate its relative size
+hypericum <- hypericum %>% 
+  left_join(size_per_id, by="Sample_id") %>% 
+  mutate(Rel_size = Size/Total_size) 
+```
+
+Filter Reads that are not assigned to a meaningful category or not assigned at all. Calculate nuber of reads matching to species in genus _Hypericum_.
+
+```{r}
+total_reads_not_assigned <- hypericum %>%   filter(Taxon == "cellular organisms" |
+  Taxon == "environmental sample" |
+  Taxon == "Eukaryota" |
+  Taxon == "Pentapetalae" |
+  Taxon == "Eudicotyledons" |
+  Taxon == "Not assigned") %>% group_by(Taxon) %>% 
+  summarise(Size = sum(Size)) %>% pull() %>% sum() 
+
+# Total number of reads not assigned grouped by taxonomic unit
+taxa_reads_notassigned <- hypericum %>% 
+  filter(Taxon == "cellular organisms" |
+  Taxon == "environmental sample" |
+  Taxon == "Eukaryota" |
+  Taxon == "Pentapetalae" |
+  Taxon == "Eudicotyledons" |
+  Taxon == "Not assigned") %>% 
+  group_by(Taxon) %>% 
+  summarise(Size = sum(Size)) %>% 
+  mutate(percent = round(Size/total_reads_not_assigned*100, digits = 1))
+
+# Total number of reads not assigned, grouped by Sample_id
+
+taxa_reads_notassigned_sample <- hypericum %>% 
+  filter(Taxon == "cellular organisms" |
+  Taxon == "environmental sample" |
+  Taxon == "Eukaryota" |
+  Taxon == "Pentapetalae" |
+  Taxon == "Eudicotyledons" |
+  Taxon == "Not assigned") %>%
+  group_by(Sample_id, Sample) %>% summarise(Size = sum(Size)) 
+
+# number of Hypericum reads per sample
+hypericum_reads <- hypericum %>% 
+  filter(str_detect(Taxon, pattern = "Hyper")) %>% 
+  group_by(Sample,Region) %>% 
+  summarise(Size = sum(Size))
+
+```
+
+Summary stats table
+
+```{r}
+summary_stats <- hypericum %>% select(Sample, Region, Sample_id, Size, Rel_size) %>% 
+  group_by(Sample_id, Sample, Region) %>% 
+  summarise(Total_reads = sum(Size), Clusters = n(), Total_rel_size = sum(Rel_size)) #%>% 
+# write.csv(x = summary_stats, file = "summary_stats_reads_clusters.csv")
+kableExtra::kable(summary_stats)
+```
+
+
+### Data Preparation for Heat Map
+
+```{r}
+hypericum_hm <- hypericum %>% 
+  group_by(Sample, Region, Taxon, Sample_id) %>% 
+  summarise(Rel_size = sum(Rel_size), Clusters = n(), Size = sum(Size)) %>% 
+  filter(Rel_size >= 0.02) %>% 
+  ungroup() %>% 
+  mutate(Sample = as.factor(Sample))
+
+hypericum_hm <- hypericum_hm %>% filter(
+  Taxon != "cellular organisms" &
+  Taxon != "environmental sample" &
+  Taxon != "Eukaryota" &
+  Taxon != "Pentapetalae" &
+  Taxon != "eudicotyledons" &
+  Taxon != "Not_assigned" &
+  Taxon != "Magnoliophyta"
+)
+
+hypericum_hm <- hypericum_hm %>% complete(Sample_id, Taxon)
+# hypericum_hm %>% arrange(Taxon)
+
+# Calculate Missing Data
+missing_data <- hypericum_hm %>% select(Taxon, Clusters) %>% 
+  group_by(Taxon) %>% 
+  summarise(Sum = sum(Clusters, na.rm=T)) %>% 
+  filter(Sum == 0) %>% select(Taxon) #%>% as.data.frame
+
+hypericum_hm2 <- hypericum_hm %>% 
+  anti_join(missing_data, by="Taxon") %>% 
+  mutate(Sample = substr(Sample_id,1,3)) %>% 
+  mutate(Region = substr(Sample_id, 5,8))
+
+### Add a new categorie "combined" 
+all_reads <- hypericum %>% select(Sample, Region, Sample_id, Size, Read_name) %>% 
+  group_by(Sample) %>% 
+  summarise(Total_reads = sum(Size), Clusters = n()) %>% 
+  mutate(Sample = as.character(Sample))
+
+hypericum_hm3 <- hypericum_hm2 %>% 
+  mutate(Region = "combined") %>%
+  left_join(all_reads, by = "Sample") %>% 
+  select(Region, Taxon, Sample, Size, Total_reads) %>% 
+  group_by(Region,Sample,Taxon, Total_reads) %>% 
+  summarise(Size = sum(Size, na.rm = T), 
+            Clusters = n()) %>%
+  mutate(Rel_size = Size/Total_reads) %>% 
+  mutate(Size = ifelse(Size == 0, NA, Size),
+         Clusters = ifelse(Clusters == 0, NA, Clusters),
+         Rel_size = ifelse(Rel_size < 0.02, NA, Rel_size))
+
+hypericum_hm4 <- bind_rows(hypericum_hm2, hypericum_hm3)
+
+```
+
+Plot Heatmap
+
+(note that the samples are renamed in the plots)
+
+```{r}
+hm <- ggplot(data = hypericum_hm4, aes(x = Region, 
+                                       y = Taxon, 
+                                       fill = Rel_size, 
+                                       group = Sample)
+             ) +
+  geom_tile(stat = "identity", colour = "white") + 
+  theme_bw() + 
+  scale_fill_gradient(name = "Rel. Abund.", 
+                      low = "antiquewhite1", 
+                      high = "coral4", 
+                      na.value = "azure1") +
+  facet_grid(~Sample,
+             labeller = labeller(Sample = c('826' = "218", 
+                                            '827' = "224",
+                                            '829' = "228",
+                                            '830' = "229",
+                                            '834' = "251")
+                                 )
+             ) +
+  theme_grey(base_size=8) +
+  theme(
+    axis.text.y = element_text(face="italic"),
+    axis.text.x = element_text(face = "bold", size = 6),
+    axis.ticks=element_line(size=0.4),
+    plot.background=element_blank(),
+    panel.border=element_blank(),
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    legend.title = element_text(size = 8),
+    axis.title.x = element_blank(),
+    strip.text.x = element_text(size = 8,
+                                face = "bold")
+    )
+
+hm
+```
+
+
+```{r}
+tiff(filename = "Heatmap.tiff", height = 4, width = 8, res = 300, units = "in")
+hm
+dev.off()
+```
+
+### Main taxonomic categories
+
+How many reads mapped to Hypericum?
+
+```{r}
+hypericum_hm4 %>% group_by(Taxon, Sample_id, Sample, Region) %>% 
+  summarise(Rel_size = round(sum(Rel_size, na.rm = T), digits = 2)) %>% 
+  filter(str_detect(Taxon, 'Hyperic')) %>% 
+  filter(Rel_size > 0) %>% 
+  filter(Region == "combined")
+```
+
+# Local BLAST analysis
+
+## Importing Local Blast Hits
+
+Data Transformation
+
+```{r}
+blast.local <- read.table("samplelist_all_reanalysis.megablast")
+
+names(blast.local) <- c("Sample","Region","qseqid", "Taxon", 
+                        "pident", "length", "mismatch", 
+                        "gapopen", "qstart", "qend", "sstart", 
+                        "send","evalue","bitscore" )
+
+blast.local <- blast.local %>% 
+  mutate(Taxon = substr(Taxon, 7,100)) %>% 
+  mutate(Sample = as.character(Sample)) %>% 
+  mutate(Sample_id = paste(Sample,Region, sep = "_")) %>% 
+  mutate(Size = str_extract(qseqid, "[^_size_]+$")) %>% 
+  mutate(Size = str_remove(Size, ";")) %>%
+  mutate(Size = as.numeric(Size)) %>% 
+  mutate(qseqid = gsub("_size.*","",qseqid)) 
+
+# Calculate total reads per cluster
+total_reads <- blast.local %>% 
+  select(Sample,Region, Size, qseqid) %>% 
+  distinct() %>% 
+  select(Sample,Region, Size) %>% 
+  group_by(Sample, Region) %>% 
+  summarise(Total_reads = sum(Size), count = n()) %>% 
+  mutate(Sample_id = paste(Sample,Region, sep = "_")) %>% 
+  ungroup() %>% 
+  select(Sample_id, Total_reads)
+
+# Add Rel_size
+blast.local <- blast.local %>% left_join(total_reads, by = "Sample_id") 
+
+blast.local <- blast.local %>% 
+  mutate(Rel_size = Size/Total_reads)
+
+blast.local %>% select(Rel_size, Sample_id) %>% 
+  group_by(Sample_id) %>% summarise(Relative_size = sum(Rel_size))
+
+blast.local %>% select(Rel_size, qseqid, Sample_id, Rel_size) %>% distinct() %>% 
+  group_by(Sample_id) %>% 
+  summarise(Rel_size = sum(Rel_size), count=n())
+```
+
+```{r}
+pident_relabundance <- blast.local %>%
+  filter(Region == "ITS1" | Region == "ITS2") %>% 
+  group_by(Sample,Region, qseqid, Rel_size, Size) %>% 
+  summarise(best_hit = max(pident))
+
+# Hits from Hypericum NCBI
+
+hypericum_ncbi <- hypericum %>% 
+  filter(str_detect(string = Taxon, pattern = "Hyp")) %>% 
+  select(Taxon, Read_name, Sample_id) %>% 
+  mutate(NCBI = "Hit") %>% 
+  rename(qseqid = Read_name) 
+
+blast.local.ncbiInfo <- blast.local %>% 
+  left_join(hypericum_ncbi, by="qseqid") %>% 
+  mutate(NCBI = replace_na(NCBI, "No Hit"))
+
+```
+
+```{r}
+pident_relabundance <- blast.local.ncbiInfo %>%
+  filter(Region == "ITS1" | Region == "ITS2") %>% 
+  group_by(Sample,Region, qseqid, Rel_size, Size, NCBI) %>% 
+  summarise(best_hit = max(pident))
+
+plot_pident_relabundance <- ggplot(data=pident_relabundance, aes(x = Rel_size, y = best_hit, colour = NCBI)) +
+  geom_point() + 
+  facet_grid(Region~.~Sample,
+             labeller = labeller(
+        Sample = c('826' = "218", 
+                   '827' = "224",
+                   '829' = "228",
+                   '830' = "229",
+                   '834' = "251"
+                   ))) +
+  ylab("Best Match per Cluster (% Sequence identity)") +
+  xlab("Relative Abundance of Clusters") +
+  scale_colour_manual(values = c("red", "darkgrey")) +
+  theme(
+    axis.title.y = element_text(),
+    axis.title.x = element_text(),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    strip.text.x = element_text(face = "bold"),
+    strip.text.y = element_text(face = "bold")
+  )
+
+plot_pident_relabundance
+
+```
+
+
+### Export Image
+```{r}
+tiff(filename = "Pident_Plot.tiff", height = 4, width = 6, res = 300, units = "in")
+plot_pident_relabundance
+dev.off()
+```
+
+
+```{r}
+taxa_best_hits_pident <- blast.local.ncbiInfo %>% 
+  group_by(Sample, Region, qseqid, NCBI) %>%
+  filter(pident == max(pident)) %>% 
+  arrange(Sample,Region,qseqid,Rel_size, bitscore, pident, Taxon.x) %>% 
+  filter(NCBI =="Hit") %>% 
+  select(Region, Sample, Taxon.x, Sample_id.x, bitscore, pident,qseqid, Rel_size)
+
+write.csv(taxa_best_hits_pident, file="taxa_best_hits_pident99.csv")
+getwd()
+
+taxa_best_hist_rf <- read.csv("taxa_best_hits_NCBI.csv", header=T)
+#taxa_best_hist_rf <- read.csv("taxa_best_hits_pident99.csv", header=T)
+
+taxa_best_hist_rf <- taxa_best_hist_rf %>% 
+  mutate(Sample = as.character(Sample))
+taxa_best_hist_rf <- taxa_best_hist_rf %>% 
+  filter(Region == "ITS1" | Region == "ITS2") %>% 
+  filter(Rel_size > 0.02)
+```
+
+
+```{r}
+hist_local_blast <- ggplot(data = taxa_best_hist_rf, 
+                           aes(x=Region, y=Rel_size, fill=Taxon)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(name = "Taxa",
+                    values = c("H_perforatum_type_1" = "chocolate3",
+                               "H_perforatum_type_2" = "chocolate1",
+                               "H_perforatum_type_3" = "brown1",
+                               "H_perforatum_types123_H_attenuatum" = "burlywood4"),
+                    labels = c("H_perforatum_type_1" = "H. perforatum Type 1",
+                               "H_perforatum_type_2" = "H. perforatum Type 2",
+                               "H_perforatum_type_3" = "H. perforatum Type 3",
+                               "H_perforatum_types123_H_attenuatum" = "H. perforatum Types 1&2&3 \nand H. attenuatum")
+                    ) +
+  ylab("Cumulative Relative Abundance") +
+  facet_grid(.~Sample,
+             labeller = labeller(
+        Sample = c('826' = "218", 
+                   '827' = "224",
+                   '829' = "228",
+                   '830' = "229",
+                   '834' = "251"
+                   ))) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(
+      size = 8,
+      face = "bold",
+      angle = 45,
+      vjust = 1,
+      hjust = 1),
+    axis.text.y = element_text(
+      size = 8,
+      face = "bold"),
+    legend.text = element_text(
+      face = "italic"),
+    strip.text.x = element_text(
+      face = "bold")
+  )
+
+hist_local_blast
+
+```
+
+```{r}
+tiff(filename = "Hypericum_histogram.tiff", height = 4, width = 6, res = 300, units = "in")
+hist_local_blast
+dev.off()
+```
